@@ -1,5 +1,11 @@
 # Notification Hub
 
+[![Node.js](https://img.shields.io/badge/node-%3E%3D20-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
+[![NestJS](https://img.shields.io/badge/nestjs-11-E0234E?logo=nestjs&logoColor=white)](https://nestjs.com/)
+[![TypeScript](https://img.shields.io/badge/typescript-5.3-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
+[![Prisma](https://img.shields.io/badge/prisma-5-2D3748?logo=prisma&logoColor=white)](https://www.prisma.io/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
+
 Notification Hub is a production-oriented NestJS backend for ingesting domain events, storing notification intents, and exposing a clean API for authentication, project isolation, channel management, event tracking, and retry workflows.
 
 It is designed as the core of a centralized notification platform for SaaS products and internal systems that need a single service for event intake and notification orchestration.
