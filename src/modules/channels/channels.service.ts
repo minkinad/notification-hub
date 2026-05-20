@@ -5,6 +5,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { ChannelType, Prisma } from '@prisma/client';
+import { isPrismaUniqueConstraintError } from '@common/prisma/prisma-errors';
 import { PrismaService } from '@common/prisma/prisma.service';
 import { ProjectsService } from '@modules/projects/projects.service';
 import { CreateChannelDto } from './dto/create-channel.dto';
@@ -28,13 +29,18 @@ export class ChannelsService {
       createChannelDto.type,
     );
 
-    return this.prisma.notificationChannel.create({
-      data: {
-        ...createChannelDto,
-        config: createChannelDto.config as Prisma.InputJsonValue,
-      },
-      select: this.channelSelect,
-    });
+    try {
+      return await this.prisma.notificationChannel.create({
+        data: {
+          ...createChannelDto,
+          config: createChannelDto.config as Prisma.InputJsonValue,
+        },
+        select: this.channelSelect,
+      });
+    } catch (error) {
+      this.rethrowUniqueChannelConstraint(error, createChannelDto.type);
+      throw error;
+    }
   }
 
   async findAll(userId: string, projectId: string) {
@@ -108,11 +114,19 @@ export class ChannelsService {
       data.config = updateChannelDto.config as Prisma.InputJsonValue;
     }
 
-    return this.prisma.notificationChannel.update({
-      where: { id },
-      data,
-      select: this.channelSelect,
-    });
+    try {
+      return await this.prisma.notificationChannel.update({
+        where: { id },
+        data,
+        select: this.channelSelect,
+      });
+    } catch (error) {
+      this.rethrowUniqueChannelConstraint(
+        error,
+        updateChannelDto.type ?? existingChannel.type,
+      );
+      throw error;
+    }
   }
 
   async delete(id: string, userId: string) {
@@ -228,5 +242,16 @@ export class ChannelsService {
     }
 
     return value as Record<string, unknown>;
+  }
+
+  private rethrowUniqueChannelConstraint(
+    error: unknown,
+    type: ChannelType,
+  ) {
+    if (isPrismaUniqueConstraintError(error)) {
+      throw new ConflictException(
+        `Channel type ${type} already exists for this project`,
+      );
+    }
   }
 }

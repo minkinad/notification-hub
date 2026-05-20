@@ -27,6 +27,7 @@ describe('EventsService', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     const transactionClient = {
+      notificationChannel: prisma.notificationChannel,
       event: prisma.event,
       notification: prisma.notification,
     };

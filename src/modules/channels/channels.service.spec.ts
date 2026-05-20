@@ -54,6 +54,22 @@ describe('ChannelsService', () => {
     ).rejects.toBeInstanceOf(ConflictException);
   });
 
+  it('translates database unique conflicts into a domain conflict', async () => {
+    prisma.notificationChannel.findFirst.mockResolvedValue(null);
+    prisma.notificationChannel.create.mockRejectedValue({ code: 'P2002' });
+
+    await expect(
+      service.create('user-1', {
+        projectId: 'project-1',
+        type: ChannelType.EMAIL,
+        name: 'Email',
+        config: {
+          to: 'alerts@example.com',
+        },
+      }),
+    ).rejects.toBeInstanceOf(ConflictException);
+  });
+
   it('validates merged type and config on update', async () => {
     jest.spyOn(service, 'findOne').mockResolvedValue({
       id: 'channel-1',
@@ -75,5 +91,31 @@ describe('ChannelsService', () => {
     ).rejects.toBeInstanceOf(BadRequestException);
 
     expect(prisma.notificationChannel.update).not.toHaveBeenCalled();
+  });
+
+  it('translates update unique conflicts into a domain conflict', async () => {
+    jest.spyOn(service, 'findOne').mockResolvedValue({
+      id: 'channel-1',
+      projectId: 'project-1',
+      type: ChannelType.EMAIL,
+      name: 'Email',
+      config: {
+        to: 'alerts@example.com',
+      },
+      active: true,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    prisma.notificationChannel.findFirst.mockResolvedValue(null);
+    prisma.notificationChannel.update.mockRejectedValue({ code: 'P2002' });
+
+    await expect(
+      service.update('channel-1', 'user-1', {
+        type: ChannelType.SMS,
+        config: {
+          phone: '+10000000000',
+        },
+      }),
+    ).rejects.toBeInstanceOf(ConflictException);
   });
 });

@@ -5,6 +5,7 @@ import {
 } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { PrismaService } from '@common/prisma/prisma.service';
+import { isPrismaUniqueConstraintError } from '@common/prisma/prisma-errors';
 import * as bcrypt from 'bcryptjs';
 import { LoginDto } from './dto/login.dto';
 import { RegisterDto } from './dto/register.dto';
@@ -17,7 +18,8 @@ export class AuthService {
   ) {}
 
   async register(registerDto: RegisterDto) {
-    const { email, password, firstName, lastName } = registerDto;
+    const email = this.normalizeEmail(registerDto.email);
+    const { password, firstName, lastName } = registerDto;
 
     const existingUser = await this.prisma.user.findUnique({
       where: { email },
@@ -29,14 +31,24 @@ export class AuthService {
 
     const hashedPassword = await bcrypt.hash(password, 10);
 
-    const user = await this.prisma.user.create({
-      data: {
-        email,
-        password: hashedPassword,
-        firstName,
-        lastName,
-      },
-    });
+    let user;
+
+    try {
+      user = await this.prisma.user.create({
+        data: {
+          email,
+          password: hashedPassword,
+          firstName,
+          lastName,
+        },
+      });
+    } catch (error) {
+      if (isPrismaUniqueConstraintError(error)) {
+        throw new BadRequestException('User with this email already exists');
+      }
+
+      throw error;
+    }
 
     const accessToken = this.jwtService.sign({
       sub: user.id,
@@ -51,7 +63,8 @@ export class AuthService {
   }
 
   async login(loginDto: LoginDto) {
-    const { email, password } = loginDto;
+    const email = this.normalizeEmail(loginDto.email);
+    const { password } = loginDto;
 
     const user = await this.prisma.user.findUnique({
       where: { email },
@@ -113,5 +126,9 @@ export class AuthService {
       lastName: user.lastName,
       role: user.role,
     };
+  }
+
+  private normalizeEmail(email: string) {
+    return email.trim().toLowerCase();
   }
 }

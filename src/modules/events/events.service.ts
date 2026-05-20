@@ -115,14 +115,14 @@ export class EventsService {
     projectId: string,
     payload: { type: string; data: Record<string, unknown> },
   ) {
-    const channels = await this.prisma.notificationChannel.findMany({
-      where: {
-        projectId,
-        active: true,
-      },
-    });
+    const result = await this.prisma.$transaction(async (tx) => {
+      const channels = await tx.notificationChannel.findMany({
+        where: {
+          projectId,
+          active: true,
+        },
+      });
 
-    const event = await this.prisma.$transaction(async (tx) => {
       const createdEvent = await tx.event.create({
         data: {
           projectId,
@@ -147,12 +147,15 @@ export class EventsService {
         });
       }
 
-      return createdEvent;
+      return {
+        event: createdEvent,
+        notificationsCreated: channels.length,
+      };
     });
 
     return {
-      ...event,
-      notificationsCreated: channels.length,
+      ...result.event,
+      notificationsCreated: result.notificationsCreated,
     };
   }
 
