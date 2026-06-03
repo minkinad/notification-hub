@@ -12,6 +12,7 @@ import { EventsModule } from '@modules/events/events.module';
 import { NotificationsModule } from '@modules/notifications/notifications.module';
 import { ChannelsModule } from '@modules/channels/channels.module';
 import { HealthModule } from '@modules/health/health.module';
+import { WorkManagementModule } from '@modules/work-management/work-management.module';
 
 @Module({
   imports: [
@@ -38,6 +39,7 @@ import { HealthModule } from '@modules/health/health.module';
     EventsModule,
     NotificationsModule,
     ChannelsModule,
+    WorkManagementModule,
     HealthModule,
   ],
 })
