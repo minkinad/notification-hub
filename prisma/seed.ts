@@ -14,6 +14,11 @@ function getApiKeyPrefix(value: string) {
 
 async function main() {
   // Clean existing data
+  await prisma.workItemComment.deleteMany();
+  await prisma.workItem.deleteMany();
+  await prisma.workView.deleteMany();
+  await prisma.workCycle.deleteMany();
+  await prisma.workModule.deleteMany();
   await prisma.deliveryLog.deleteMany();
   await prisma.notification.deleteMany();
   await prisma.notificationChannel.deleteMany();
@@ -117,6 +122,73 @@ async function main() {
     emailChannel,
     telegramChannel,
     webhookChannel,
+  });
+
+  const cycle = await prisma.workCycle.create({
+    data: {
+      projectId: project.id,
+      name: 'Sprint 1',
+      description: 'Initial Plane-style planning cycle',
+      status: 'ACTIVE',
+      startDate: new Date(),
+      endDate: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000),
+    },
+  });
+
+  const module = await prisma.workModule.create({
+    data: {
+      projectId: project.id,
+      name: 'Provider integrations',
+      description: 'Delivery provider roadmap',
+      status: 'ACTIVE',
+      targetDate: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+    },
+  });
+
+  const workItem = await prisma.workItem.create({
+    data: {
+      projectId: project.id,
+      sequence: 1,
+      title: 'Add Slack delivery provider',
+      description: 'Track provider-specific implementation work in the hub.',
+      status: 'TODO',
+      priority: 'HIGH',
+      labels: ['backend', 'provider'],
+      estimate: 3,
+      cycleId: cycle.id,
+      moduleId: module.id,
+      assigneeId: user.id,
+      reporterId: user.id,
+    },
+  });
+
+  await prisma.workItemComment.create({
+    data: {
+      workItemId: workItem.id,
+      authorId: user.id,
+      body: 'Seeded example comment for work item collaboration.',
+    },
+  });
+
+  const view = await prisma.workView.create({
+    data: {
+      projectId: project.id,
+      name: 'High priority backend work',
+      layout: 'KANBAN',
+      filters: {
+        priority: ['HIGH', 'URGENT'],
+        labels: ['backend'],
+      },
+      shared: true,
+      createdById: user.id,
+    },
+  });
+
+  console.log('Created work management sample:', {
+    cycle,
+    module,
+    workItem,
+    view,
   });
 }
 
