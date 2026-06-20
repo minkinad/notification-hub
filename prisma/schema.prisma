@@ -24,10 +24,6 @@ model User {
   projects          Project[]
   apiKeys           ApiKey[]
   auditLogs         AuditLog[]
-  assignedWorkItems WorkItem[]        @relation("WorkItemAssignee")
-  reportedWorkItems WorkItem[]        @relation("WorkItemReporter")
-  workItemComments  WorkItemComment[]
-  workViews         WorkView[]
 
   @@map("users")
 }
@@ -51,10 +47,6 @@ model Project {
   channels      NotificationChannel[]
   apiKeys       ApiKey[]
   auditLogs     AuditLog[]
-  workCycles    WorkCycle[]
-  workModules   WorkModule[]
-  workItems     WorkItem[]
-  workViews     WorkView[]
 
   @@index([userId])
   @@map("projects")
@@ -201,117 +193,6 @@ model AuditLog {
   @@map("audit_logs")
 }
 
-model WorkCycle {
-  id          String          @id @default(cuid())
-  projectId   String
-  project     Project         @relation(fields: [projectId], references: [id], onDelete: Cascade)
-  name        String
-  description String?
-  status      WorkCycleStatus @default(PLANNED)
-  startDate   DateTime?
-  endDate     DateTime?
-  createdAt   DateTime        @default(now())
-  updatedAt   DateTime        @updatedAt
-
-  workItems WorkItem[]
-
-  @@unique([projectId, name])
-  @@index([projectId])
-  @@index([status])
-  @@map("work_cycles")
-}
-
-model WorkModule {
-  id          String           @id @default(cuid())
-  projectId   String
-  project     Project          @relation(fields: [projectId], references: [id], onDelete: Cascade)
-  name        String
-  description String?
-  status      WorkModuleStatus @default(PLANNED)
-  targetDate  DateTime?
-  createdAt   DateTime         @default(now())
-  updatedAt   DateTime         @updatedAt
-
-  workItems WorkItem[]
-
-  @@unique([projectId, name])
-  @@index([projectId])
-  @@index([status])
-  @@map("work_modules")
-}
-
-model WorkItem {
-  id          String           @id @default(cuid())
-  projectId   String
-  project     Project          @relation(fields: [projectId], references: [id], onDelete: Cascade)
-  sequence    Int
-  title       String
-  description String?
-  status      WorkItemStatus   @default(BACKLOG)
-  priority    WorkItemPriority @default(NONE)
-  labels      Json             @default("[]")
-  estimate    Int?
-  dueDate     DateTime?
-  sortOrder   Float            @default(0)
-  cycleId     String?
-  cycle       WorkCycle?       @relation(fields: [cycleId], references: [id], onDelete: SetNull)
-  moduleId    String?
-  module      WorkModule?      @relation(fields: [moduleId], references: [id], onDelete: SetNull)
-  assigneeId  String?
-  assignee    User?            @relation("WorkItemAssignee", fields: [assigneeId], references: [id], onDelete: SetNull)
-  reporterId  String?
-  reporter    User?            @relation("WorkItemReporter", fields: [reporterId], references: [id], onDelete: SetNull)
-  createdAt   DateTime         @default(now())
-  updatedAt   DateTime         @updatedAt
-  completedAt DateTime?
-
-  comments WorkItemComment[]
-
-  @@unique([projectId, sequence])
-  @@index([projectId])
-  @@index([status])
-  @@index([priority])
-  @@index([cycleId])
-  @@index([moduleId])
-  @@index([assigneeId])
-  @@map("work_items")
-}
-
-model WorkItemComment {
-  id         String   @id @default(cuid())
-  workItemId String
-  workItem   WorkItem @relation(fields: [workItemId], references: [id], onDelete: Cascade)
-  authorId   String
-  author     User     @relation(fields: [authorId], references: [id], onDelete: Cascade)
-  body       String
-  createdAt  DateTime @default(now())
-  updatedAt  DateTime @updatedAt
-
-  @@index([workItemId])
-  @@index([authorId])
-  @@map("work_item_comments")
-}
-
-model WorkView {
-  id          String         @id @default(cuid())
-  projectId   String
-  project     Project        @relation(fields: [projectId], references: [id], onDelete: Cascade)
-  name        String
-  description String?
-  layout      WorkViewLayout @default(KANBAN)
-  filters     Json           @default("{}")
-  shared      Boolean        @default(false)
-  createdById String?
-  createdBy   User?          @relation(fields: [createdById], references: [id], onDelete: SetNull)
-  createdAt   DateTime       @default(now())
-  updatedAt   DateTime       @updatedAt
-
-  @@unique([projectId, name])
-  @@index([projectId])
-  @@index([createdById])
-  @@map("work_views")
-}
-
 enum Role {
   ADMIN
   USER
@@ -345,42 +226,4 @@ enum DeliveryStatus {
   FAILED
   PENDING
   RETRYING
-}
-
-enum WorkCycleStatus {
-  PLANNED
-  ACTIVE
-  COMPLETED
-  CANCELED
-}
-
-enum WorkModuleStatus {
-  PLANNED
-  ACTIVE
-  COMPLETED
-  CANCELED
-}
-
-enum WorkItemStatus {
-  BACKLOG
-  TODO
-  IN_PROGRESS
-  IN_REVIEW
-  DONE
-  CANCELED
-}
-
-enum WorkItemPriority {
-  NONE
-  LOW
-  MEDIUM
-  HIGH
-  URGENT
-}
-
-enum WorkViewLayout {
-  KANBAN
-  LIST
-  CALENDAR
-  GANTT
 }

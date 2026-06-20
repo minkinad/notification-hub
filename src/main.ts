@@ -60,7 +60,6 @@ async function bootstrap() {
     .addTag('events', 'Event management')
     .addTag('channels', 'Notification channel management')
     .addTag('notifications', 'Notification tracking')
-    .addTag('work-management', 'Plane-style work item planning')
     .addBearerAuth()
     .build();
 
