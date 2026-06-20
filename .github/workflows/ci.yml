@@ -25,7 +25,8 @@ jobs:
           - 22.x
     env:
       DATABASE_URL: postgresql://user:password@localhost:5432/notification_hub
-      JWT_SECRET: ci-test-secret-123456
+      JWT_SECRET: ci-test-secret-with-at-least-32-characters
+      CHANNEL_CONFIG_ENCRYPTION_KEY: ci-channel-config-key-with-at-least-32-characters
       NODE_ENV: test
     steps:
       - name: Checkout repository
@@ -65,7 +66,8 @@ jobs:
     timeout-minutes: 15
     env:
       DATABASE_URL: postgresql://user:password@localhost:5432/notification_hub
-      JWT_SECRET: ci-test-secret-123456
+      JWT_SECRET: ci-test-secret-with-at-least-32-characters
+      CHANNEL_CONFIG_ENCRYPTION_KEY: ci-channel-config-key-with-at-least-32-characters
       NODE_ENV: test
     steps:
       - name: Checkout repository

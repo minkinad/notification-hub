@@ -15,6 +15,8 @@ import {
   readNumberField,
   readStringRecord,
 } from '@common/utils/json';
+import { decryptSensitiveJson } from '@common/utils/secrets';
+import { NotificationDeliveryOutboxService } from './notification-delivery-outbox.service';
 import { NotificationDeliveryQueueService } from './notification-delivery-queue.service';
 
 type NotificationForDelivery = Prisma.NotificationGetPayload<{
@@ -31,7 +33,9 @@ export class NotificationDeliveryService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly queueService: NotificationDeliveryQueueService,
-    @Optional() private readonly configService?: ConfigService,
+    private readonly configService: ConfigService,
+    @Optional()
+    private readonly outboxService?: NotificationDeliveryOutboxService,
   ) {}
 
   async deliver(notificationId: string) {
@@ -133,23 +137,55 @@ export class NotificationDeliveryService {
             },
           },
         });
+        if (shouldRetry && this.outboxService && nextRetryAt) {
+          await tx.deliveryOutbox.upsert({
+            where: {
+              notificationId: notification.id,
+            },
+            create: {
+              notificationId: notification.id,
+              nextAttemptAt: nextRetryAt,
+            },
+            update: {
+              attempts: 0,
+              lastError: null,
+              nextAttemptAt: nextRetryAt,
+            },
+          });
+        }
         await this.refreshEventStatus(tx, notification.eventId);
       });
 
+      let queuePending = false;
       if (shouldRetry) {
-        await this.queueService.enqueue(notification.id, retryDelayMs);
+        try {
+          await this.queueService.enqueue(notification.id, retryDelayMs);
+          await this.outboxService?.markEnqueued([notification.id]);
+        } catch (queueError) {
+          queuePending = true;
+          const queueMessage =
+            queueError instanceof Error
+              ? queueError.message
+              : String(queueError);
+          this.logger.warn(
+            `Retry for notification ${notification.id} remains in outbox: ${queueMessage}`,
+          );
+        }
       }
 
       return {
         delivered: false,
         retryScheduled: shouldRetry,
+        queuePending,
         error: message,
       };
     }
   }
 
   private async deliverToChannel(notification: NotificationForDelivery) {
-    const config = asJsonRecord(notification.channel.config);
+    const config = asJsonRecord(
+      decryptSensitiveJson(notification.channel.config, this.encryptionKey),
+    );
 
     if (notification.channel.type === ChannelType.WEBHOOK) {
       return this.deliverWebhook(notification, config);
@@ -304,5 +340,11 @@ export class NotificationDeliveryService {
 
   private getStatusCode(value: Prisma.InputJsonValue) {
     return readNumberField(value, 'statusCode');
+  }
+
+  private get encryptionKey() {
+    return this.configService.getOrThrow<string>(
+      'CHANNEL_CONFIG_ENCRYPTION_KEY',
+    );
   }
 }

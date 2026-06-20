@@ -8,8 +8,19 @@ export const envValidationSchema = Joi.object({
   DATABASE_URL: Joi.string()
     .uri({ scheme: ['postgres', 'postgresql'] })
     .required(),
-  JWT_SECRET: Joi.string().min(16).required(),
+  JWT_SECRET: Joi.string()
+    .min(32)
+    .invalid(
+      'replace_with_a_long_random_secret',
+      'replace_with_at_least_32_random_characters',
+      'change_me_to_a_long_random_secret_32_chars',
+    )
+    .required(),
   JWT_EXPIRATION: Joi.string().default('7d'),
+  CHANNEL_CONFIG_ENCRYPTION_KEY: Joi.string()
+    .min(32)
+    .invalid('replace_with_at_least_32_random_characters')
+    .required(),
   REDIS_URL: Joi.string()
     .uri({ scheme: ['redis'] })
     .optional(),

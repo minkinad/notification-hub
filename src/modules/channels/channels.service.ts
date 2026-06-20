@@ -5,12 +5,17 @@ import {
   NotFoundException,
   Optional,
 } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { ChannelType, Prisma } from '@prisma/client';
 import { AuditService } from '@common/audit/audit.service';
 import { isPrismaUniqueConstraintError } from '@common/prisma/prisma-errors';
 import { PrismaService } from '@common/prisma/prisma.service';
 import { asJsonRecord, readNonEmptyString } from '@common/utils/json';
-import { maskSensitiveJson } from '@common/utils/secrets';
+import {
+  decryptSensitiveJson,
+  encryptSensitiveJson,
+  maskSensitiveJson,
+} from '@common/utils/secrets';
 import { ProjectsService } from '@modules/projects/projects.service';
 import { CreateChannelDto } from './dto/create-channel.dto';
 import { UpdateChannelDto } from './dto/update-channel.dto';
@@ -20,6 +25,7 @@ export class ChannelsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly projectsService: ProjectsService,
+    private readonly configService: ConfigService,
     @Optional() private readonly auditService?: AuditService,
   ) {}
 
@@ -38,7 +44,10 @@ export class ChannelsService {
       const channel = await this.prisma.notificationChannel.create({
         data: {
           ...createChannelDto,
-          config: createChannelDto.config as Prisma.InputJsonValue,
+          config: encryptSensitiveJson(
+            createChannelDto.config,
+            this.encryptionKey,
+          ) as Prisma.InputJsonValue,
         },
         select: this.channelSelect,
       });
@@ -90,7 +99,8 @@ export class ChannelsService {
     if (shouldValidateConfig) {
       const nextType = updateChannelDto.type ?? existingChannel.type;
       const nextConfig = asJsonRecord(
-        updateChannelDto.config ?? existingChannel.config,
+        updateChannelDto.config ??
+          decryptSensitiveJson(existingChannel.config, this.encryptionKey),
       );
       this.assertChannelConfig(nextType, nextConfig);
     }
@@ -119,7 +129,10 @@ export class ChannelsService {
     }
 
     if (updateChannelDto.config !== undefined) {
-      data.config = updateChannelDto.config as Prisma.InputJsonValue;
+      data.config = encryptSensitiveJson(
+        updateChannelDto.config,
+        this.encryptionKey,
+      ) as Prisma.InputJsonValue;
     }
 
     try {
@@ -205,8 +218,16 @@ export class ChannelsService {
   private maskChannel<T extends { config: unknown }>(channel: T): T {
     return {
       ...channel,
-      config: maskSensitiveJson(channel.config),
+      config: maskSensitiveJson(
+        decryptSensitiveJson(channel.config, this.encryptionKey),
+      ),
     };
+  }
+
+  private get encryptionKey() {
+    return this.configService.getOrThrow<string>(
+      'CHANNEL_CONFIG_ENCRYPTION_KEY',
+    );
   }
 
   private async ensureChannelTypeAvailable(
@@ -262,10 +283,17 @@ export class ChannelsService {
       );
 
       try {
-        new URL(url);
+        const parsedUrl = new URL(url);
+        if (
+          !['http:', 'https:'].includes(parsedUrl.protocol) ||
+          parsedUrl.username ||
+          parsedUrl.password
+        ) {
+          throw new Error('Unsupported webhook URL');
+        }
       } catch {
         throw new BadRequestException(
-          'WEBHOOK channel config field `url` must be a valid URL',
+          'WEBHOOK channel config field `url` must be an HTTP(S) URL without credentials',
         );
       }
       return;

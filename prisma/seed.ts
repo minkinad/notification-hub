@@ -1,6 +1,8 @@
+import 'dotenv/config';
 import { PrismaClient } from '@prisma/client';
 import { createHash } from 'crypto';
 import * as bcrypt from 'bcryptjs';
+import { encryptSensitiveJson } from '../src/common/utils/secrets';
 
 const prisma = new PrismaClient();
 
@@ -13,6 +15,11 @@ function getApiKeyPrefix(value: string) {
 }
 
 async function main() {
+  const channelEncryptionKey = process.env.CHANNEL_CONFIG_ENCRYPTION_KEY;
+  if (!channelEncryptionKey) {
+    throw new Error('CHANNEL_CONFIG_ENCRYPTION_KEY is required for seeding');
+  }
+
   // Clean existing data
   await prisma.deliveryLog.deleteMany();
   await prisma.notification.deleteMany();
@@ -35,7 +42,11 @@ async function main() {
     },
   });
 
-  console.log('Created user:', user);
+  console.log('Created user:', {
+    id: user.id,
+    email: user.email,
+    role: user.role,
+  });
 
   // Create seed project
   const legacyApiKey = 'test-api-key-12345';
@@ -52,7 +63,8 @@ async function main() {
   });
 
   console.log('Created project:', {
-    ...project,
+    id: project.id,
+    name: project.name,
     apiKey: legacyApiKey,
   });
 
@@ -71,7 +83,9 @@ async function main() {
   });
 
   console.log('Created API key:', {
-    ...apiKey,
+    id: apiKey.id,
+    name: apiKey.name,
+    keyPrefix: apiKey.keyPrefix,
     key: managedApiKey,
   });
 
@@ -94,10 +108,13 @@ async function main() {
       projectId: project.id,
       type: 'TELEGRAM',
       name: 'Telegram Channel',
-      config: {
-        chatId: '@notification_hub_alerts',
-        botToken: process.env.TELEGRAM_BOT_TOKEN || 'test-token',
-      },
+      config: encryptSensitiveJson(
+        {
+          chatId: '@notification_hub_alerts',
+          botToken: process.env.TELEGRAM_BOT_TOKEN || 'test-token',
+        },
+        channelEncryptionKey,
+      ),
     },
   });
 

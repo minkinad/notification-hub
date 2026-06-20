@@ -14,12 +14,20 @@ describe('ChannelsService', () => {
   const projectsService = {
     ensureOwnedProject: jest.fn(),
   } as any;
+  const configService = {
+    getOrThrow: jest
+      .fn()
+      .mockReturnValue('unit-test-channel-config-key-with-32-characters'),
+  } as any;
 
   let service: ChannelsService;
 
   beforeEach(() => {
     jest.clearAllMocks();
-    service = new ChannelsService(prisma, projectsService);
+    prisma.notificationChannel.create.mockReset();
+    prisma.notificationChannel.findFirst.mockReset();
+    prisma.notificationChannel.update.mockReset();
+    service = new ChannelsService(prisma, projectsService, configService);
   });
 
   it('rejects invalid webhook config before persisting', async () => {
@@ -30,6 +38,21 @@ describe('ChannelsService', () => {
         name: 'Webhook',
         config: {
           url: 'not-a-url',
+        },
+      }),
+    ).rejects.toBeInstanceOf(BadRequestException);
+
+    expect(prisma.notificationChannel.create).not.toHaveBeenCalled();
+  });
+
+  it('rejects webhook URLs with unsupported protocols or credentials', async () => {
+    await expect(
+      service.create('user-1', {
+        projectId: 'project-1',
+        type: ChannelType.WEBHOOK,
+        name: 'Unsafe webhook',
+        config: {
+          url: 'ftp://user:password@example.com/hook',
         },
       }),
     ).rejects.toBeInstanceOf(BadRequestException);
@@ -137,6 +160,40 @@ describe('ChannelsService', () => {
 
     const result = await service.findOne('channel-1', 'user-1');
 
+    expect(result.config).toEqual({
+      chatId: '@alerts',
+      botToken: 'very...oken',
+    });
+  });
+
+  it('encrypts sensitive config values before persistence', async () => {
+    prisma.notificationChannel.create.mockResolvedValue({
+      id: 'channel-1',
+      projectId: 'project-1',
+      type: ChannelType.TELEGRAM,
+      name: 'Telegram',
+      config: {
+        chatId: '@alerts',
+        botToken: 'very-secret-token',
+      },
+      active: true,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+
+    const result = await service.create('user-1', {
+      projectId: 'project-1',
+      type: ChannelType.TELEGRAM,
+      name: 'Telegram',
+      config: {
+        chatId: '@alerts',
+        botToken: 'very-secret-token',
+      },
+    });
+
+    const persistedConfig =
+      prisma.notificationChannel.create.mock.calls[0][0].data.config;
+    expect(JSON.stringify(persistedConfig)).not.toContain('very-secret-token');
     expect(result.config).toEqual({
       chatId: '@alerts',
       botToken: 'very...oken',
