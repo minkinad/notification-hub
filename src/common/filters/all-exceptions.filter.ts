@@ -44,7 +44,6 @@ export class AllExceptionsFilter implements ExceptionFilter {
         message = exceptionResponse as string;
       }
     } else if (exception instanceof Error) {
-      message = exception.message;
       this.logger.error(
         `Unhandled error: ${exception.message}`,
         exception.stack,
