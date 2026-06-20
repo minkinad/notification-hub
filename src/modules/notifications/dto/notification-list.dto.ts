@@ -20,3 +20,13 @@ export class NotificationListQueryDto extends PaginationQueryDto {
   @IsEnum(NotificationStatus)
   status?: NotificationStatus;
 }
+
+export class DeadLetterListQueryDto extends PaginationQueryDto {
+  @ApiProperty({
+    description: 'Project identifier',
+    required: false,
+  })
+  @IsOptional()
+  @IsString()
+  projectId?: string;
+}

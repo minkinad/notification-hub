@@ -4,8 +4,17 @@ import { NotificationsService } from './notifications.service';
 
 describe('NotificationsService', () => {
   const prisma = {
+    $transaction: jest.fn(),
     notification: {
+      count: jest.fn(),
       findFirst: jest.fn(),
+      findMany: jest.fn(),
+      update: jest.fn(),
+    },
+    deliveryOutbox: {
+      upsert: jest.fn(),
+    },
+    event: {
       update: jest.fn(),
     },
   } as any;
@@ -18,6 +27,10 @@ describe('NotificationsService', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    queueService.enqueue.mockReset().mockResolvedValue(undefined);
+    prisma.$transaction.mockImplementation((callback: any) =>
+      Promise.resolve(callback(prisma)),
+    );
     service = new NotificationsService(prisma, queueService as any);
   });
 
@@ -87,5 +100,135 @@ describe('NotificationsService', () => {
     );
     expect(queueService.enqueue).toHaveBeenCalledWith('notification-1', 60_000);
     expect(result.status).toBe(NotificationStatus.RETRYING);
+  });
+
+  it('keeps a durable outbox entry when retry queueing fails', async () => {
+    const outboxService = {
+      markEnqueued: jest.fn(),
+    };
+    service = new NotificationsService(
+      prisma,
+      queueService as any,
+      outboxService as any,
+    );
+    prisma.notification.findFirst.mockResolvedValue({
+      id: 'notification-1',
+      projectId: 'project-1',
+      status: NotificationStatus.FAILED,
+      retryCount: 0,
+      maxRetries: 3,
+      channel: {
+        id: 'channel-1',
+        type: 'WEBHOOK',
+        name: 'Webhook',
+      },
+      event: {
+        id: 'event-1',
+        type: 'invoice.created',
+        status: 'FAILED',
+      },
+      deliveryLogs: [],
+    });
+    prisma.notification.update.mockResolvedValue({
+      id: 'notification-1',
+      projectId: 'project-1',
+      status: NotificationStatus.RETRYING,
+      retryCount: 1,
+      maxRetries: 3,
+      nextRetryAt: new Date(),
+    });
+    queueService.enqueue.mockRejectedValue(new Error('Redis unavailable'));
+
+    const result = await service.retry('notification-1', 'user-1');
+
+    expect(prisma.deliveryOutbox.upsert).toHaveBeenCalledWith({
+      where: {
+        notificationId: 'notification-1',
+      },
+      create: {
+        notificationId: 'notification-1',
+        nextAttemptAt: expect.any(Date),
+      },
+      update: {
+        attempts: 0,
+        lastError: null,
+        nextAttemptAt: expect.any(Date),
+      },
+    });
+    expect(outboxService.markEnqueued).not.toHaveBeenCalled();
+    expect(result).toEqual(
+      expect.objectContaining({
+        status: NotificationStatus.RETRYING,
+        queuePending: true,
+      }),
+    );
+  });
+
+  it('lists failed notifications as dead letters', async () => {
+    prisma.notification.findMany.mockResolvedValue([]);
+    prisma.notification.count.mockResolvedValue(0);
+
+    await service.findDeadLetters('user-1', { projectId: 'project-1' }, 0, 25);
+
+    expect(prisma.notification.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          project: { userId: 'user-1' },
+          projectId: 'project-1',
+          status: NotificationStatus.FAILED,
+        },
+        skip: 0,
+        take: 25,
+      }),
+    );
+  });
+
+  it('replays a dead-letter notification with a fresh retry budget', async () => {
+    const outboxService = {
+      markEnqueued: jest.fn(),
+    };
+    service = new NotificationsService(
+      prisma,
+      queueService as any,
+      outboxService as any,
+    );
+    prisma.notification.findFirst.mockResolvedValue({
+      id: 'notification-1',
+      projectId: 'project-1',
+      eventId: 'event-1',
+      status: NotificationStatus.FAILED,
+      retryCount: 3,
+      maxRetries: 3,
+      channel: { id: 'channel-1', type: 'WEBHOOK', name: 'Webhook' },
+      event: { id: 'event-1', type: 'invoice.created', status: 'FAILED' },
+      deliveryLogs: [],
+    });
+    prisma.notification.update.mockResolvedValue({
+      id: 'notification-1',
+      projectId: 'project-1',
+      eventId: 'event-1',
+      status: NotificationStatus.RETRYING,
+      retryCount: 0,
+    });
+
+    const result = await service.replay('notification-1', 'user-1');
+
+    expect(prisma.notification.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: 'notification-1' },
+        data: expect.objectContaining({
+          status: NotificationStatus.RETRYING,
+          retryCount: 0,
+          lastError: null,
+        }),
+      }),
+    );
+    expect(prisma.event.update).toHaveBeenCalledWith({
+      where: { id: 'event-1' },
+      data: { status: 'PROCESSING' },
+    });
+    expect(queueService.enqueue).toHaveBeenCalledWith('notification-1');
+    expect(outboxService.markEnqueued).toHaveBeenCalledWith(['notification-1']);
+    expect(result.retryCount).toBe(0);
   });
 });
