@@ -21,9 +21,11 @@ It is designed as the core of a centralized notification platform for SaaS produ
 - Redis-backed ingest rate limiting per managed API key or legacy project key
 - Channel management for `EMAIL`, `TELEGRAM`, `WEBHOOK`, and `SMS`
 - Event ingestion through authenticated API calls or `x-api-key`
+- Project-scoped idempotency keys for duplicate-safe event ingestion
 - Automatic notification creation, outbox-backed BullMQ delivery scheduling, and queue recovery
 - Notification inspection, retry scheduling, delivery logs, and status transitions
-- Plane-style work management inside projects: cycles, modules, work items, comments, saved views, priorities, labels, estimates, due dates, and assignees
+- Dead-letter inspection and replay for permanently failed notifications
+- AES-256-GCM encryption for sensitive channel configuration values at rest
 - Audit logging for project, API key, channel, event, and notification retry writes
 - Prisma migrations and PostgreSQL persistence
 - HTTP delivery protections for timeout, response-size limits, redirects, and local/private network targets
@@ -43,7 +45,6 @@ The service is organized around a modular NestJS application:
 - `channels`: channel configuration per project
 - `events`: event ingestion and notification fan-out
 - `notifications`: notification visibility and retry control
-- `work-management`: Plane-style project planning with cycles, modules, work items, comments, and saved views
 - `health`: service health endpoint
 - `common`: guards, filters, interceptors, Prisma, Redis, queue bootstrap
 
@@ -84,7 +85,6 @@ Implemented:
 - Redis-backed ingest rate limiting
 - Event-to-notification fan-out and outbox-backed BullMQ delivery queueing
 - Delivery state machine with retry/backoff and delivery logs
-- Plane-style work management APIs for cycles, modules, work items, comments, and saved views
 - HTTP delivery guardrails for webhook/HTTP providers
 - Audit logs for write operations
 - Prisma migration history
@@ -103,6 +103,14 @@ Not included yet:
 ## Quick Start
 
 ### Option A: Full stack with Docker
+
+Create the environment file and replace `JWT_SECRET` and
+`CHANNEL_CONFIG_ENCRYPTION_KEY` with separate values of at least 32 random
+characters:
+
+```bash
+cp .env.example .env
+```
 
 ```bash
 npm run docker:up
@@ -143,6 +151,9 @@ Create environment file:
 ```bash
 cp .env.example .env
 ```
+
+Replace `JWT_SECRET` and `CHANNEL_CONFIG_ENCRYPTION_KEY` before starting the
+application.
 
 Generate Prisma client:
 
@@ -189,6 +200,7 @@ Required:
 
 - `DATABASE_URL`
 - `JWT_SECRET`
+- `CHANNEL_CONFIG_ENCRYPTION_KEY`
 
 Recommended:
 
@@ -209,7 +221,6 @@ The seed script creates a default admin account and sample project data.
 - Password: `admin123`
 - Legacy project API key: `test-api-key-12345`
 - Managed ingest API key: `test-managed-api-key-12345`
-- Sample cycle, module, work item, comment, and saved view are created for the default project
 
 ## API Overview
 
@@ -257,34 +268,10 @@ Events:
 Notifications:
 
 - `GET /notifications`
+- `GET /notifications/dead-letter`
 - `GET /notifications/:id`
 - `POST /notifications/:id/retry`
-
-Work management:
-
-- `POST /work/cycles`
-- `GET /work/cycles`
-- `GET /work/cycles/:id`
-- `PATCH /work/cycles/:id`
-- `DELETE /work/cycles/:id`
-- `POST /work/modules`
-- `GET /work/modules`
-- `GET /work/modules/:id`
-- `PATCH /work/modules/:id`
-- `DELETE /work/modules/:id`
-- `POST /work/items`
-- `GET /work/items`
-- `GET /work/items/:id`
-- `PATCH /work/items/:id`
-- `DELETE /work/items/:id`
-- `POST /work/items/:id/comments`
-- `GET /work/items/:id/comments`
-- `DELETE /work/items/:id/comments/:commentId`
-- `POST /work/views`
-- `GET /work/views`
-- `GET /work/views/:id`
-- `PATCH /work/views/:id`
-- `DELETE /work/views/:id`
+- `POST /notifications/:id/replay`
 
 System:
 
@@ -369,56 +356,12 @@ curl -X POST http://localhost:3000/api/v1/projects/<PROJECT_ID>/api-keys \
 
 The `key` value is returned only in this create response. Subsequent project and API-key reads expose `apiKeyPrefix` or `keyPrefix`, while the database stores only SHA-256 hashes.
 
-### Plan project work
-
-```bash
-curl -X POST http://localhost:3000/api/v1/work/cycles \
-  -H "Authorization: Bearer <JWT_TOKEN>" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "projectId": "<PROJECT_ID>",
-    "name": "Sprint 1",
-    "status": "ACTIVE",
-    "startDate": "2026-06-03T00:00:00.000Z",
-    "endDate": "2026-06-17T00:00:00.000Z"
-  }'
-```
-
-```bash
-curl -X POST http://localhost:3000/api/v1/work/items \
-  -H "Authorization: Bearer <JWT_TOKEN>" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "projectId": "<PROJECT_ID>",
-    "title": "Add Slack delivery provider",
-    "status": "TODO",
-    "priority": "HIGH",
-    "labels": ["backend", "provider"],
-    "estimate": 3
-  }'
-```
-
-```bash
-curl -X POST http://localhost:3000/api/v1/work/views \
-  -H "Authorization: Bearer <JWT_TOKEN>" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "projectId": "<PROJECT_ID>",
-    "name": "High priority backend work",
-    "layout": "KANBAN",
-    "filters": {
-      "priority": ["HIGH", "URGENT"],
-      "labels": ["backend"]
-    },
-    "shared": true
-  }'
-```
-
 ### Ingest an event with project API key
 
 ```bash
 curl -X POST http://localhost:3000/api/v1/events/ingest \
   -H "x-api-key: <PROJECT_API_KEY>" \
+  -H "Idempotency-Key: invoice-inv_1001" \
   -H "Content-Type: application/json" \
   -d '{
     "type": "invoice.created",
@@ -455,9 +398,11 @@ The current test suite covers critical service behavior:
 - event fan-out into notification records
 - notification creation behavior with and without active channels
 - managed API key verification and creation
+- idempotent event ingestion
 - ingest rate limiting
 - notification retry scheduling and delivery status transitions
-- Plane-style work management API compilation through Prisma/NestJS build checks
+- channel config encryption and dead-letter replay
+- API key, project isolation, delivery, and validation regressions
 
 Run tests with:
 
@@ -476,7 +421,8 @@ npm test
 - `GET /api/v1/health/ready` checks PostgreSQL and Redis and returns `503` when dependencies are unavailable.
 - Delivery workers process webhook and Telegram deliveries directly. Email and SMS use HTTP-provider delivery when configured, otherwise mock delivery is recorded for local workflows.
 - Project and managed API keys are stored as SHA-256 hashes with non-secret prefixes for lookup/debugging. Full secrets are only returned when created or regenerated.
-- Channel config responses and audit changes redact sensitive fields such as tokens, secrets, passwords, authorization headers, and API keys.
+- Sensitive channel config values are encrypted at rest and redacted in API responses and audit changes.
+- Keep `CHANNEL_CONFIG_ENCRYPTION_KEY` stable and backed up; changing it requires re-encrypting existing channel configs.
 
 ## Deployment
 
@@ -497,7 +443,7 @@ See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for environment variables, probes, 
 ## Roadmap
 
 - Add provider-specific email and SMS adapters
-- Add dead-letter queue processing
+- Add dead-letter retention policies and bulk replay
 - Add e2e coverage against real Postgres and Redis
 - Add metrics and observability integrations
 

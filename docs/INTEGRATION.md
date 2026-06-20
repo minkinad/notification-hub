@@ -45,6 +45,7 @@ Managed API keys support scopes, expiration, revocation, last-used tracking, and
 ```bash
 curl -X POST "$NOTIFICATION_HUB_URL/api/v1/events/ingest" \
   -H "x-api-key: $NOTIFICATION_HUB_API_KEY" \
+  -H "Idempotency-Key: invoice-inv_1001" \
   -H "Content-Type: application/json" \
   -d '{
     "type": "invoice.created",
@@ -57,6 +58,11 @@ curl -X POST "$NOTIFICATION_HUB_URL/api/v1/events/ingest" \
 ```
 
 Successful ingestion creates an event and notification intents for active project channels. Delivery is asynchronous.
+
+`Idempotency-Key` is optional, project-scoped, and limited to 255 characters.
+Repeated requests with the same key return the original event without creating
+duplicate notification intents. Use a stable business identifier and reuse it
+when retrying a timed-out ingest request.
 
 ## Event Payload Contract
 
@@ -104,6 +110,11 @@ Notifications:
 - `SENT`: provider accepted delivery or mock delivery was recorded
 - `RETRYING`: scheduled for another attempt
 - `FAILED`: retries exhausted
+
+Permanently failed notifications are available through
+`GET /notifications/dead-letter`. An operator can schedule a fresh delivery
+cycle with `POST /notifications/:id/replay`; replay resets the retry budget and
+uses the delivery outbox if Redis is unavailable.
 
 ## Health Endpoints
 

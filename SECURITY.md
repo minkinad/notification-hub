@@ -22,7 +22,7 @@ You should receive an acknowledgement within 72 hours. If the issue is accepted,
 Notification Hub is designed with these defaults:
 
 - API keys are stored as SHA-256 hashes and revealed only once.
-- Channel config responses redact sensitive fields.
+- Sensitive channel config fields are encrypted with AES-256-GCM and redacted in responses.
 - Webhook and HTTP-provider delivery block localhost/private networks by default.
 - HTTP delivery uses timeout and response-size limits.
 - Event ingestion supports project and per-key rate limits.
@@ -30,6 +30,7 @@ Notification Hub is designed with these defaults:
 Operators are still responsible for:
 
 - using strong `JWT_SECRET` values
+- keeping `CHANNEL_CONFIG_ENCRYPTION_KEY` stable, separate, and backed up
 - enforcing TLS at the edge
 - storing API keys in a secret manager
 - configuring CORS for trusted origins
