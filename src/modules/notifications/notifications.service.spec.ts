@@ -1,4 +1,4 @@
-import { BadRequestException } from '@nestjs/common';
+import { BadRequestException, ConflictException } from '@nestjs/common';
 import { NotificationStatus } from '@prisma/client';
 import { NotificationsService } from './notifications.service';
 
@@ -9,7 +9,9 @@ describe('NotificationsService', () => {
       count: jest.fn(),
       findFirst: jest.fn(),
       findMany: jest.fn(),
+      findUnique: jest.fn(),
       update: jest.fn(),
+      updateMany: jest.fn(),
     },
     deliveryOutbox: {
       upsert: jest.fn(),
@@ -28,6 +30,7 @@ describe('NotificationsService', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     queueService.enqueue.mockReset().mockResolvedValue(undefined);
+    prisma.notification.updateMany.mockResolvedValue({ count: 1 });
     prisma.$transaction.mockImplementation((callback: any) =>
       Promise.resolve(callback(prisma)),
     );
@@ -49,6 +52,7 @@ describe('NotificationsService', () => {
     prisma.notification.findFirst.mockResolvedValue({
       id: 'notification-1',
       projectId: 'project-1',
+      eventId: 'event-1',
       status: NotificationStatus.FAILED,
       retryCount: 0,
       maxRetries: 3,
@@ -64,7 +68,7 @@ describe('NotificationsService', () => {
       },
       deliveryLogs: [],
     });
-    prisma.notification.update.mockResolvedValue({
+    prisma.notification.findUnique.mockResolvedValue({
       id: 'notification-1',
       projectId: 'project-1',
       status: NotificationStatus.RETRYING,
@@ -85,10 +89,12 @@ describe('NotificationsService', () => {
 
     const result = await service.retry('notification-1', 'user-1');
 
-    expect(prisma.notification.update).toHaveBeenCalledWith(
+    expect(prisma.notification.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
         where: {
           id: 'notification-1',
+          status: NotificationStatus.FAILED,
+          retryCount: 0,
         },
         data: expect.objectContaining({
           status: NotificationStatus.RETRYING,
@@ -114,6 +120,7 @@ describe('NotificationsService', () => {
     prisma.notification.findFirst.mockResolvedValue({
       id: 'notification-1',
       projectId: 'project-1',
+      eventId: 'event-1',
       status: NotificationStatus.FAILED,
       retryCount: 0,
       maxRetries: 3,
@@ -129,7 +136,7 @@ describe('NotificationsService', () => {
       },
       deliveryLogs: [],
     });
-    prisma.notification.update.mockResolvedValue({
+    prisma.notification.findUnique.mockResolvedValue({
       id: 'notification-1',
       projectId: 'project-1',
       status: NotificationStatus.RETRYING,
@@ -183,6 +190,41 @@ describe('NotificationsService', () => {
     );
   });
 
+  it('rejects retry when another request changed the notification', async () => {
+    prisma.notification.findFirst.mockResolvedValue({
+      id: 'notification-1',
+      projectId: 'project-1',
+      eventId: 'event-1',
+      status: NotificationStatus.FAILED,
+      retryCount: 0,
+      maxRetries: 3,
+      channel: { id: 'channel-1', type: 'WEBHOOK', name: 'Webhook' },
+      event: { id: 'event-1', type: 'invoice.created', status: 'FAILED' },
+      deliveryLogs: [],
+    });
+    prisma.notification.updateMany.mockResolvedValue({ count: 0 });
+
+    await expect(
+      service.retry('notification-1', 'user-1'),
+    ).rejects.toBeInstanceOf(ConflictException);
+    expect(prisma.event.update).not.toHaveBeenCalled();
+    expect(queueService.enqueue).not.toHaveBeenCalled();
+  });
+
+  it('rejects a retry that is already scheduled', async () => {
+    prisma.notification.findFirst.mockResolvedValue({
+      id: 'notification-1',
+      status: NotificationStatus.RETRYING,
+      retryCount: 1,
+      maxRetries: 3,
+    });
+
+    await expect(
+      service.retry('notification-1', 'user-1'),
+    ).rejects.toBeInstanceOf(BadRequestException);
+    expect(prisma.$transaction).not.toHaveBeenCalled();
+  });
+
   it('replays a dead-letter notification with a fresh retry budget', async () => {
     const outboxService = {
       markEnqueued: jest.fn(),
@@ -203,7 +245,7 @@ describe('NotificationsService', () => {
       event: { id: 'event-1', type: 'invoice.created', status: 'FAILED' },
       deliveryLogs: [],
     });
-    prisma.notification.update.mockResolvedValue({
+    prisma.notification.findUnique.mockResolvedValue({
       id: 'notification-1',
       projectId: 'project-1',
       eventId: 'event-1',
@@ -213,9 +255,13 @@ describe('NotificationsService', () => {
 
     const result = await service.replay('notification-1', 'user-1');
 
-    expect(prisma.notification.update).toHaveBeenCalledWith(
+    expect(prisma.notification.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
-        where: { id: 'notification-1' },
+        where: {
+          id: 'notification-1',
+          status: NotificationStatus.FAILED,
+          retryCount: 3,
+        },
         data: expect.objectContaining({
           status: NotificationStatus.RETRYING,
           retryCount: 0,
