@@ -4,8 +4,9 @@ import {
   NotFoundException,
   Optional,
 } from '@nestjs/common';
-import { ChannelType, EventStatus, Prisma } from '@prisma/client';
+import { ChannelType, Event, EventStatus, Prisma } from '@prisma/client';
 import { AuditService } from '@common/audit/audit.service';
+import { isPrismaUniqueConstraintError } from '@common/prisma/prisma-errors';
 import { PrismaService } from '@common/prisma/prisma.service';
 import { ProjectRateLimitService } from '@common/rate-limit/project-rate-limit.service';
 import {
@@ -34,16 +35,24 @@ export class EventsService {
     @Optional() private readonly auditService?: AuditService,
   ) {}
 
-  async create(userId: string, createEventDto: CreateEventDto) {
+  async create(
+    userId: string,
+    createEventDto: CreateEventDto,
+    idempotencyKey?: string,
+  ) {
     await this.projectsService.ensureOwnedProject(
       createEventDto.projectId,
       userId,
     );
 
-    const event = await this.createEventRecord(createEventDto.projectId, {
-      type: createEventDto.type,
-      data: createEventDto.data,
-    });
+    const event = await this.createEventRecord(
+      createEventDto.projectId,
+      {
+        type: createEventDto.type,
+        data: createEventDto.data,
+      },
+      this.normalizeIdempotencyKey(idempotencyKey),
+    );
 
     await this.auditService?.log({
       userId,
@@ -60,7 +69,15 @@ export class EventsService {
     return event;
   }
 
-  async ingest(apiKey: string, ingestEventDto: IngestEventDto) {
+  async ingest(
+    apiKey: string | undefined,
+    ingestEventDto: IngestEventDto,
+    idempotencyKey?: string,
+  ) {
+    if (!apiKey?.trim()) {
+      throw new BadRequestException('Project API key is required');
+    }
+
     const verification = await this.projectsService.verifyApiKey(apiKey);
 
     if (!verification) {
@@ -81,7 +98,11 @@ export class EventsService {
       windowSeconds: managedApiKey?.rateLimitWindow ?? project.rateLimitWindow,
     });
 
-    const event = await this.createEventRecord(project.id, ingestEventDto);
+    const event = await this.createEventRecord(
+      project.id,
+      ingestEventDto,
+      this.normalizeIdempotencyKey(idempotencyKey),
+    );
 
     await this.auditService?.log({
       userId: project.userId,
@@ -174,68 +195,103 @@ export class EventsService {
   private async createEventRecord(
     projectId: string,
     payload: { type: string; data: Record<string, unknown> },
+    idempotencyKey?: string,
   ) {
-    const result = await this.prisma.$transaction(async (tx) => {
-      const channels = await tx.notificationChannel.findMany({
-        where: {
-          projectId,
-          active: true,
-        },
-      });
+    if (idempotencyKey) {
+      const existingEvent = await this.findIdempotentEvent(
+        projectId,
+        idempotencyKey,
+      );
+      if (existingEvent) {
+        return existingEvent;
+      }
+    }
 
-      const createdEvent = await tx.event.create({
-        data: {
-          projectId,
-          type: payload.type,
-          data: payload.data as Prisma.InputJsonValue,
-          status:
-            channels.length > 0 ? EventStatus.PROCESSING : EventStatus.PENDING,
-        },
-      });
+    let result: {
+      event: Event;
+      notificationsCreated: number;
+      notificationIds: string[];
+    };
+    try {
+      result = await this.prisma.$transaction(async (tx) => {
+        const channels = await tx.notificationChannel.findMany({
+          where: {
+            projectId,
+            active: true,
+          },
+        });
 
-      const notificationIds: string[] = [];
-      if (channels.length > 0) {
-        const notifications = await Promise.all(
-          channels.map((channel) =>
-            tx.notification.create({
-              data: {
-                projectId,
-                eventId: createdEvent.id,
-                channelId: channel.id,
-                recipient: this.resolveRecipient(channel.type, channel.config),
-                subject: this.resolveSubject(channel.type, payload.type),
-                template: payload.type,
-                templateData: payload.data as Prisma.InputJsonValue,
-              },
-              select: {
-                id: true,
-              },
-            }),
-          ),
-        );
-        notificationIds.push(
-          ...notifications.map((notification) => notification.id),
-        );
+        const createdEvent = await tx.event.create({
+          data: {
+            projectId,
+            ...(idempotencyKey ? { idempotencyKey } : {}),
+            type: payload.type,
+            data: payload.data as Prisma.InputJsonValue,
+            status:
+              channels.length > 0
+                ? EventStatus.PROCESSING
+                : EventStatus.PENDING,
+          },
+        });
 
-        if (this.outboxService) {
-          await Promise.all(
-            notificationIds.map((notificationId) =>
-              tx.deliveryOutbox.create({
+        const notificationIds: string[] = [];
+        if (channels.length > 0) {
+          const notifications = await Promise.all(
+            channels.map((channel) =>
+              tx.notification.create({
                 data: {
-                  notificationId,
+                  projectId,
+                  eventId: createdEvent.id,
+                  channelId: channel.id,
+                  recipient: this.resolveRecipient(
+                    channel.type,
+                    channel.config,
+                  ),
+                  subject: this.resolveSubject(channel.type, payload.type),
+                  template: payload.type,
+                  templateData: payload.data as Prisma.InputJsonValue,
+                },
+                select: {
+                  id: true,
                 },
               }),
             ),
           );
+          notificationIds.push(
+            ...notifications.map((notification) => notification.id),
+          );
+
+          if (this.outboxService) {
+            await Promise.all(
+              notificationIds.map((notificationId) =>
+                tx.deliveryOutbox.create({
+                  data: {
+                    notificationId,
+                  },
+                }),
+              ),
+            );
+          }
+        }
+
+        return {
+          event: createdEvent,
+          notificationsCreated: channels.length,
+          notificationIds,
+        };
+      });
+    } catch (error) {
+      if (idempotencyKey && isPrismaUniqueConstraintError(error)) {
+        const existingEvent = await this.findIdempotentEvent(
+          projectId,
+          idempotencyKey,
+        );
+        if (existingEvent) {
+          return existingEvent;
         }
       }
-
-      return {
-        event: createdEvent,
-        notificationsCreated: channels.length,
-        notificationIds,
-      };
-    });
+      throw error;
+    }
 
     if (result.notificationIds.length > 0) {
       try {
@@ -266,6 +322,54 @@ export class EventsService {
       notificationsCreated: result.notificationsCreated,
       notificationsQueued: result.notificationIds.length,
     };
+  }
+
+  private async findIdempotentEvent(projectId: string, idempotencyKey: string) {
+    const existingEvent = await this.prisma.event.findUnique({
+      where: {
+        projectId_idempotencyKey: {
+          projectId,
+          idempotencyKey,
+        },
+      },
+      include: {
+        notifications: {
+          select: {
+            id: true,
+          },
+        },
+      },
+    });
+
+    if (!existingEvent) {
+      return null;
+    }
+
+    const { notifications, ...event } = existingEvent;
+    return {
+      ...event,
+      notificationsCreated: notifications.length,
+      notificationsQueued: 0,
+      idempotentReplay: true,
+    };
+  }
+
+  private normalizeIdempotencyKey(value?: string) {
+    if (value === undefined) {
+      return undefined;
+    }
+
+    const normalized = value.trim();
+    if (!normalized) {
+      throw new BadRequestException('Idempotency-Key cannot be empty');
+    }
+    if (normalized.length > 255) {
+      throw new BadRequestException(
+        'Idempotency-Key cannot exceed 255 characters',
+      );
+    }
+
+    return normalized;
   }
 
   private resolveRecipient(

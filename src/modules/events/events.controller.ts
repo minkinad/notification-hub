@@ -32,13 +32,19 @@ export class EventsController {
   @Version('1')
   @UseGuards(JwtGuard)
   @ApiBearerAuth()
+  @ApiHeader({
+    name: 'Idempotency-Key',
+    description: 'Optional project-scoped key that prevents duplicate events',
+    required: false,
+  })
   @ApiOperation({ summary: 'Create event for owned project' })
   @ApiResponse({ status: 201, description: 'Event created successfully' })
   async create(
     @CurrentUser() user: JwtUser,
+    @Headers('idempotency-key') idempotencyKey: string | undefined,
     @Body() createEventDto: CreateEventDto,
   ) {
-    return this.eventsService.create(user.id, createEventDto);
+    return this.eventsService.create(user.id, createEventDto, idempotencyKey);
   }
 
   @Post('ingest')
@@ -48,13 +54,19 @@ export class EventsController {
     description: 'Project API key',
     required: true,
   })
+  @ApiHeader({
+    name: 'Idempotency-Key',
+    description: 'Optional project-scoped key that prevents duplicate events',
+    required: false,
+  })
   @ApiOperation({ summary: 'Ingest event using project API key' })
   @ApiResponse({ status: 201, description: 'Event ingested successfully' })
   async ingest(
-    @Headers('x-api-key') apiKey: string,
+    @Headers('x-api-key') apiKey: string | undefined,
+    @Headers('idempotency-key') idempotencyKey: string | undefined,
     @Body() ingestEventDto: IngestEventDto,
   ) {
-    return this.eventsService.ingest(apiKey, ingestEventDto);
+    return this.eventsService.ingest(apiKey, ingestEventDto, idempotencyKey);
   }
 
   @Get()

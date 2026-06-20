@@ -1,3 +1,4 @@
+import { BadRequestException } from '@nestjs/common';
 import { ChannelType, EventStatus } from '@prisma/client';
 import { EventsService } from './events.service';
 
@@ -10,6 +11,7 @@ describe('EventsService', () => {
     event: {
       create: jest.fn(),
       count: jest.fn(),
+      findUnique: jest.fn(),
       findMany: jest.fn(),
       update: jest.fn(),
     },
@@ -181,6 +183,55 @@ describe('EventsService', () => {
     expect(result.notificationsQueued).toBe(0);
   });
 
+  it('returns the original event for a repeated idempotency key', async () => {
+    prisma.event.findUnique.mockResolvedValue({
+      id: 'event-existing',
+      projectId: 'project-1',
+      idempotencyKey: 'invoice-inv-1',
+      type: 'invoice.created',
+      data: { invoiceId: 'inv-1' },
+      status: EventStatus.PROCESSING,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      notifications: [{ id: 'notification-1' }],
+    });
+
+    const result = await service.create(
+      'user-1',
+      {
+        projectId: 'project-1',
+        type: 'invoice.created',
+        data: { invoiceId: 'inv-1' },
+      },
+      'invoice-inv-1',
+    );
+
+    expect(prisma.event.findUnique).toHaveBeenCalledWith({
+      where: {
+        projectId_idempotencyKey: {
+          projectId: 'project-1',
+          idempotencyKey: 'invoice-inv-1',
+        },
+      },
+      include: {
+        notifications: {
+          select: {
+            id: true,
+          },
+        },
+      },
+    });
+    expect(prisma.$transaction).not.toHaveBeenCalled();
+    expect(result).toEqual(
+      expect.objectContaining({
+        id: 'event-existing',
+        notificationsCreated: 1,
+        notificationsQueued: 0,
+        idempotentReplay: true,
+      }),
+    );
+  });
+
   it('applies managed API key scope and project rate limits on ingest', async () => {
     const rateLimitService = {
       consume: jest.fn(),
@@ -226,6 +277,17 @@ describe('EventsService', () => {
       limit: 25,
       windowSeconds: 60,
     });
+  });
+
+  it('rejects ingest when the API key header is missing', async () => {
+    await expect(
+      service.ingest(undefined, {
+        type: 'invoice.created',
+        data: { invoiceId: 'inv-1' },
+      }),
+    ).rejects.toBeInstanceOf(BadRequestException);
+
+    expect(projectsService.verifyApiKey).not.toHaveBeenCalled();
   });
 
   it('normalizes negative pagination input', async () => {
