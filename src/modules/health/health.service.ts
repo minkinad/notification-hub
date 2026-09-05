@@ -1,39 +1,69 @@
-import { Inject, Injectable } from '@nestjs/common';
+import { Inject, Injectable, OnModuleDestroy } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import type Redis from 'ioredis';
 import { PrismaService } from '@common/prisma/prisma.service';
 import { REDIS_CLIENT } from '@common/redis/redis.module';
 
+type Dependency = 'database' | 'redis';
+type DependencyStatus =
+  | { status: 'up' }
+  | { status: 'down'; reason: 'timeout' | 'unavailable' | 'shutting_down' };
+
 @Injectable()
-export class HealthService {
+export class HealthService implements OnModuleDestroy {
+  private shuttingDown = false;
+  private readonly inFlight = new Map<Dependency, Promise<DependencyStatus>>();
+
   constructor(
     private readonly configService: ConfigService,
     private readonly prisma: PrismaService,
     @Inject(REDIS_CLIENT) private readonly redis: Redis,
   ) {}
 
+  onModuleDestroy() {
+    this.shuttingDown = true;
+  }
+
   getLiveStatus() {
     return this.getBaseStatus('ok');
   }
 
   async getStatus() {
-    const [database, redis] = await Promise.all([
-      this.checkDatabase(),
-      this.checkRedis(),
-    ]);
-    const isHealthy = database.status === 'up' && redis.status === 'up';
+    if (this.shuttingDown) {
+      return this.shutdownStatus();
+    }
 
+    const [database, redis] = await Promise.all([
+      this.checkDependency('database', async () => {
+        await this.prisma.$queryRaw`SELECT 1`;
+      }),
+      this.checkDependency('redis', async () => {
+        if ((await this.redis.ping()) !== 'PONG') {
+          throw new Error('Unexpected Redis ping response');
+        }
+      }),
+    ]);
+
+    // Shutdown may begin while dependency probes are still in flight.
+    if (this.shuttingDown) return this.shutdownStatus();
     return {
-      ...this.getBaseStatus(isHealthy ? 'ok' : 'degraded'),
-      dependencies: {
-        database,
-        redis,
-      },
+      ...this.getBaseStatus(
+        database.status === 'up' && redis.status === 'up' ? 'ok' : 'degraded',
+      ),
+      dependencies: { database, redis },
     };
   }
 
-  async getReadyStatus() {
+  getReadyStatus() {
     return this.getStatus();
+  }
+
+  private shutdownStatus() {
+    const down: DependencyStatus = { status: 'down', reason: 'shutting_down' };
+    return {
+      ...this.getBaseStatus('degraded'),
+      dependencies: { database: down, redis: down },
+    };
   }
 
   private getBaseStatus(status: 'ok' | 'degraded') {
@@ -47,41 +77,33 @@ export class HealthService {
     };
   }
 
-  private async checkDatabase() {
+  private async checkDependency(name: Dependency, check: () => Promise<void>) {
+    let operation = this.inFlight.get(name);
+    if (!operation) {
+      operation = Promise.resolve()
+        .then(check)
+        .then<DependencyStatus, DependencyStatus>(
+          () => ({ status: 'up' }),
+          () => ({ status: 'down', reason: 'unavailable' }),
+        )
+        .finally(() => this.inFlight.delete(name));
+      this.inFlight.set(name, operation);
+    }
+
+    // A deadline bounds the response, not the underlying driver operation.
+    // Retain that operation until it settles to avoid accumulating queries or
+    // offline Redis commands during an outage. Its rejection is always handled.
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<DependencyStatus>((resolve) => {
+      timer = setTimeout(
+        () => resolve({ status: 'down', reason: 'timeout' }),
+        this.configService.get<number>('HEALTH_CHECK_TIMEOUT_MS', 2000),
+      );
+    });
     try {
-      await this.prisma.$queryRaw`SELECT 1`;
-
-      return {
-        status: 'up' as const,
-      };
-    } catch (error) {
-      return {
-        status: 'down' as const,
-        message: this.getErrorMessage(error),
-      };
+      return await Promise.race([operation, timeout]);
+    } finally {
+      clearTimeout(timer);
     }
-  }
-
-  private async checkRedis() {
-    try {
-      await this.redis.ping();
-
-      return {
-        status: 'up' as const,
-      };
-    } catch (error) {
-      return {
-        status: 'down' as const,
-        message: this.getErrorMessage(error),
-      };
-    }
-  }
-
-  private getErrorMessage(error: unknown) {
-    if (error instanceof Error) {
-      return error.message;
-    }
-
-    return 'Unknown dependency error';
   }
 }

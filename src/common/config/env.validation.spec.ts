@@ -40,4 +40,24 @@ describe('environment validation', () => {
 
     expect(result.error).toBeUndefined();
   });
+  it.each([0, -1, 1.5, 30001])(
+    'rejects invalid health deadline %s',
+    (timeout) => {
+      expect(
+        envValidationSchema.validate({
+          ...baseEnvironment,
+          JWT_SECRET: 'local-test-secret-with-more-than-32-characters',
+          HEALTH_CHECK_TIMEOUT_MS: timeout,
+        }).error,
+      ).toBeDefined();
+    },
+  );
+
+  it('defaults the health deadline to two seconds', () => {
+    const result = envValidationSchema.validate({
+      ...baseEnvironment,
+      JWT_SECRET: 'local-test-secret-with-more-than-32-characters',
+    });
+    expect(result.value.HEALTH_CHECK_TIMEOUT_MS).toBe(2000);
+  });
 });

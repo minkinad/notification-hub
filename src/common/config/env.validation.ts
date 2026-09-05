@@ -27,6 +27,11 @@ export const envValidationSchema = Joi.object({
   REDIS_HOST: Joi.string().default('localhost'),
   REDIS_PORT: Joi.number().port().default(6379),
   CORS_ORIGIN: Joi.string().default('*'),
+  HEALTH_CHECK_TIMEOUT_MS: Joi.number()
+    .integer()
+    .min(1)
+    .max(30000)
+    .default(2000),
   APP_NAME: Joi.string().default('NotificationHub'),
   APP_VERSION: Joi.string().default('1.0.0'),
   RATE_LIMIT_WINDOW_MS: Joi.number().integer().positive().default(60000),
