@@ -25,10 +25,22 @@ describe('EventsService', () => {
     verifyApiKey: jest.fn(),
   } as any;
 
+  const outboxService = {
+    schedule: jest.fn(),
+    dispatch: jest.fn(),
+  };
+  const rateLimitService = { consume: jest.fn() };
   let service: EventsService;
 
   beforeEach(() => {
-    jest.clearAllMocks();
+    jest.resetAllMocks();
+    outboxService.schedule.mockImplementation((_tx: unknown, id: string) => ({
+      id: `schedule-${id}`,
+    }));
+    outboxService.dispatch.mockImplementation((entries: unknown[]) => ({
+      queued: entries.length,
+      pending: 0,
+    }));
     prisma.notification.create.mockImplementation(({ data }: any) =>
       Promise.resolve({
         id: `notification-${data.channelId}`,
@@ -43,7 +55,12 @@ describe('EventsService', () => {
       (callback: (client: typeof transactionClient) => unknown) =>
         Promise.resolve(callback(transactionClient)),
     );
-    service = new EventsService(prisma, projectsService);
+    service = new EventsService(
+      prisma,
+      projectsService,
+      outboxService as any,
+      rateLimitService as any,
+    );
   });
 
   it('creates pending notifications for active channels', async () => {
@@ -121,15 +138,6 @@ describe('EventsService', () => {
   });
 
   it('queues delivery jobs when queue service is configured', async () => {
-    const queueService = {
-      enqueueMany: jest.fn(),
-    };
-    service = new EventsService(
-      prisma,
-      projectsService,
-      undefined,
-      queueService as any,
-    );
     prisma.notificationChannel.findMany.mockResolvedValue([
       {
         id: 'channel-email',
@@ -156,8 +164,37 @@ describe('EventsService', () => {
       data: { userId: 'user-1' },
     });
 
-    expect(queueService.enqueueMany).toHaveBeenCalledWith(['notification-1']);
+    expect(outboxService.dispatch).toHaveBeenCalledWith([
+      { id: 'schedule-notification-1' },
+    ]);
+    expect(outboxService.schedule).toHaveBeenCalledWith(
+      expect.anything(),
+      'notification-1',
+    );
     expect(result.notificationsQueued).toBe(1);
+  });
+
+  it('reports partial dispatch without overwriting a concurrently completed event', async () => {
+    prisma.notificationChannel.findMany.mockResolvedValue([
+      { id: 'one', type: ChannelType.EMAIL, config: { to: 'a@example.com' } },
+      { id: 'two', type: ChannelType.SMS, config: { phone: '+123' } },
+    ]);
+    prisma.event.create.mockResolvedValue({
+      id: 'event-1',
+      status: EventStatus.PROCESSING,
+    });
+    outboxService.dispatch.mockResolvedValue({ queued: 1, pending: 1 });
+    const result = await service.create('user-1', {
+      projectId: 'project-1',
+      type: 'created',
+      data: {},
+    });
+    expect(result).toMatchObject({
+      notificationsCreated: 2,
+      notificationsQueued: 1,
+      notificationsQueuePending: 1,
+    });
+    expect(prisma.event.update).not.toHaveBeenCalled();
   });
 
   it('creates a pending event when no channels are configured', async () => {
@@ -239,6 +276,7 @@ describe('EventsService', () => {
     service = new EventsService(
       prisma,
       projectsService,
+      outboxService as any,
       rateLimitService as any,
     );
     projectsService.verifyApiKey.mockResolvedValue({

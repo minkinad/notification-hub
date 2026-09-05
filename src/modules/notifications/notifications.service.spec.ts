@@ -5,6 +5,7 @@ import { NotificationsService } from './notifications.service';
 describe('NotificationsService', () => {
   const prisma = {
     $transaction: jest.fn(),
+    $queryRaw: jest.fn(),
     notification: {
       count: jest.fn(),
       findFirst: jest.fn(),
@@ -21,20 +22,22 @@ describe('NotificationsService', () => {
     },
   } as any;
 
-  const queueService = {
-    enqueue: jest.fn(),
+  const outboxService = {
+    schedule: jest.fn(),
+    dispatch: jest.fn(),
   };
 
   let service: NotificationsService;
 
   beforeEach(() => {
-    jest.clearAllMocks();
-    queueService.enqueue.mockReset().mockResolvedValue(undefined);
+    jest.resetAllMocks();
+    outboxService.schedule.mockResolvedValue({ id: 'schedule-1' });
+    outboxService.dispatch.mockResolvedValue({ queued: 1, pending: 0 });
     prisma.notification.updateMany.mockResolvedValue({ count: 1 });
     prisma.$transaction.mockImplementation((callback: any) =>
       Promise.resolve(callback(prisma)),
     );
-    service = new NotificationsService(prisma, queueService as any);
+    service = new NotificationsService(prisma, outboxService as any);
   });
 
   it('rejects retry for delivered notifications', async () => {
@@ -104,19 +107,11 @@ describe('NotificationsService', () => {
         }),
       }),
     );
-    expect(queueService.enqueue).toHaveBeenCalledWith('notification-1', 60_000);
+    expect(outboxService.dispatch).toHaveBeenCalledWith([{ id: 'schedule-1' }]);
     expect(result.status).toBe(NotificationStatus.RETRYING);
   });
 
   it('keeps a durable outbox entry when retry queueing fails', async () => {
-    const outboxService = {
-      markEnqueued: jest.fn(),
-    };
-    service = new NotificationsService(
-      prisma,
-      queueService as any,
-      outboxService as any,
-    );
     prisma.notification.findFirst.mockResolvedValue({
       id: 'notification-1',
       projectId: 'project-1',
@@ -144,25 +139,15 @@ describe('NotificationsService', () => {
       maxRetries: 3,
       nextRetryAt: new Date(),
     });
-    queueService.enqueue.mockRejectedValue(new Error('Redis unavailable'));
+    outboxService.dispatch.mockResolvedValue({ queued: 0, pending: 1 });
 
     const result = await service.retry('notification-1', 'user-1');
 
-    expect(prisma.deliveryOutbox.upsert).toHaveBeenCalledWith({
-      where: {
-        notificationId: 'notification-1',
-      },
-      create: {
-        notificationId: 'notification-1',
-        nextAttemptAt: expect.any(Date),
-      },
-      update: {
-        attempts: 0,
-        lastError: null,
-        nextAttemptAt: expect.any(Date),
-      },
-    });
-    expect(outboxService.markEnqueued).not.toHaveBeenCalled();
+    expect(outboxService.schedule).toHaveBeenCalledWith(
+      prisma,
+      'notification-1',
+      expect.any(Date),
+    );
     expect(result).toEqual(
       expect.objectContaining({
         status: NotificationStatus.RETRYING,
@@ -208,7 +193,7 @@ describe('NotificationsService', () => {
       service.retry('notification-1', 'user-1'),
     ).rejects.toBeInstanceOf(ConflictException);
     expect(prisma.event.update).not.toHaveBeenCalled();
-    expect(queueService.enqueue).not.toHaveBeenCalled();
+    expect(outboxService.dispatch).not.toHaveBeenCalled();
   });
 
   it('rejects a retry that is already scheduled', async () => {
@@ -226,14 +211,6 @@ describe('NotificationsService', () => {
   });
 
   it('replays a dead-letter notification with a fresh retry budget', async () => {
-    const outboxService = {
-      markEnqueued: jest.fn(),
-    };
-    service = new NotificationsService(
-      prisma,
-      queueService as any,
-      outboxService as any,
-    );
     prisma.notification.findFirst.mockResolvedValue({
       id: 'notification-1',
       projectId: 'project-1',
@@ -273,8 +250,7 @@ describe('NotificationsService', () => {
       where: { id: 'event-1' },
       data: { status: 'PROCESSING' },
     });
-    expect(queueService.enqueue).toHaveBeenCalledWith('notification-1');
-    expect(outboxService.markEnqueued).toHaveBeenCalledWith(['notification-1']);
+    expect(outboxService.dispatch).toHaveBeenCalledWith([{ id: 'schedule-1' }]);
     expect(result.retryCount).toBe(0);
   });
 });

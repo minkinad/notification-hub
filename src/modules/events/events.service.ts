@@ -4,7 +4,13 @@ import {
   NotFoundException,
   Optional,
 } from '@nestjs/common';
-import { ChannelType, Event, EventStatus, Prisma } from '@prisma/client';
+import {
+  ChannelType,
+  DeliveryOutbox,
+  Event,
+  EventStatus,
+  Prisma,
+} from '@prisma/client';
 import { AuditService } from '@common/audit/audit.service';
 import { isPrismaUniqueConstraintError } from '@common/prisma/prisma-errors';
 import { PrismaService } from '@common/prisma/prisma.service';
@@ -16,7 +22,6 @@ import {
 } from '@common/utils/json';
 import { normalizePagination } from '@common/utils/pagination';
 import { NotificationDeliveryOutboxService } from '@modules/notifications/delivery/notification-delivery-outbox.service';
-import { NotificationDeliveryQueueService } from '@modules/notifications/delivery/notification-delivery-queue.service';
 import { ProjectsService } from '@modules/projects/projects.service';
 import { CreateEventDto, EventListQueryDto } from './dto/create-event.dto';
 import { IngestEventDto } from './dto/ingest-event.dto';
@@ -26,12 +31,8 @@ export class EventsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly projectsService: ProjectsService,
-    @Optional()
-    private readonly rateLimitService?: ProjectRateLimitService,
-    @Optional()
-    private readonly queueService?: NotificationDeliveryQueueService,
-    @Optional()
-    private readonly outboxService?: NotificationDeliveryOutboxService,
+    private readonly outboxService: NotificationDeliveryOutboxService,
+    private readonly rateLimitService: ProjectRateLimitService,
     @Optional() private readonly auditService?: AuditService,
   ) {}
 
@@ -91,7 +92,7 @@ export class EventsService {
       throw new BadRequestException('API key is not allowed to ingest events');
     }
 
-    await this.rateLimitService?.consume({
+    await this.rateLimitService.consume({
       projectId: project.id,
       apiKeyId: managedApiKey?.id,
       limit: managedApiKey?.rateLimit ?? project.rateLimit,
@@ -210,7 +211,7 @@ export class EventsService {
     let result: {
       event: Event;
       notificationsCreated: number;
-      notificationIds: string[];
+      outboxEntries: DeliveryOutbox[];
     };
     try {
       result = await this.prisma.$transaction(async (tx) => {
@@ -234,7 +235,7 @@ export class EventsService {
           },
         });
 
-        const notificationIds: string[] = [];
+        const outboxEntries: DeliveryOutbox[] = [];
         if (channels.length > 0) {
           const notifications = await Promise.all(
             channels.map((channel) =>
@@ -257,19 +258,9 @@ export class EventsService {
               }),
             ),
           );
-          notificationIds.push(
-            ...notifications.map((notification) => notification.id),
-          );
-
-          if (this.outboxService) {
-            await Promise.all(
-              notificationIds.map((notificationId) =>
-                tx.deliveryOutbox.create({
-                  data: {
-                    notificationId,
-                  },
-                }),
-              ),
+          for (const notification of notifications) {
+            outboxEntries.push(
+              await this.outboxService.schedule(tx, notification.id),
             );
           }
         }
@@ -277,7 +268,7 @@ export class EventsService {
         return {
           event: createdEvent,
           notificationsCreated: channels.length,
-          notificationIds,
+          outboxEntries,
         };
       });
     } catch (error) {
@@ -293,34 +284,14 @@ export class EventsService {
       throw error;
     }
 
-    if (result.notificationIds.length > 0) {
-      try {
-        await this.queueService?.enqueueMany(result.notificationIds);
-        await this.outboxService?.markEnqueued(result.notificationIds);
-      } catch (error) {
-        await this.prisma.event.update({
-          where: {
-            id: result.event.id,
-          },
-          data: {
-            status: EventStatus.PENDING,
-          },
-        });
-        const message = error instanceof Error ? error.message : String(error);
-        return {
-          ...result.event,
-          notificationsCreated: result.notificationsCreated,
-          notificationsQueued: 0,
-          notificationsQueuePending: result.notificationIds.length,
-          queueError: message,
-        };
-      }
-    }
-
+    const dispatch = await this.outboxService.dispatch(result.outboxEntries);
     return {
       ...result.event,
       notificationsCreated: result.notificationsCreated,
-      notificationsQueued: result.notificationIds.length,
+      notificationsQueued: dispatch.queued,
+      ...(dispatch.pending > 0
+        ? { notificationsQueuePending: dispatch.pending }
+        : {}),
     };
   }
 

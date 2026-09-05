@@ -1,8 +1,9 @@
-import { Injectable, Logger, Optional } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import {
   ChannelType,
   DeliveryStatus,
+  DeliveryOutbox,
   EventStatus,
   NotificationStatus,
   Prisma,
@@ -17,7 +18,7 @@ import {
 } from '@common/utils/json';
 import { decryptSensitiveJson } from '@common/utils/secrets';
 import { NotificationDeliveryOutboxService } from './notification-delivery-outbox.service';
-import { NotificationDeliveryQueueService } from './notification-delivery-queue.service';
+import { lockDeliveryEvent } from './lock-delivery-event';
 
 type NotificationForDelivery = Prisma.NotificationGetPayload<{
   include: {
@@ -32,10 +33,8 @@ export class NotificationDeliveryService {
 
   constructor(
     private readonly prisma: PrismaService,
-    private readonly queueService: NotificationDeliveryQueueService,
+    private readonly outboxService: NotificationDeliveryOutboxService,
     private readonly configService: ConfigService,
-    @Optional()
-    private readonly outboxService?: NotificationDeliveryOutboxService,
   ) {}
 
   async deliver(notificationId: string) {
@@ -59,12 +58,20 @@ export class NotificationDeliveryService {
       return { skipped: true, reason: `status_${notification.status}` };
     }
 
+    if (
+      notification.nextRetryAt &&
+      notification.nextRetryAt.getTime() > Date.now()
+    ) {
+      return { skipped: true, reason: 'retry_not_due' };
+    }
+
     const claimed = await this.prisma.notification.updateMany({
       where: {
         id: notificationId,
-        status: {
-          in: [NotificationStatus.PENDING, NotificationStatus.RETRYING],
-        },
+        status: notification.status,
+        retryCount: notification.retryCount,
+        updatedAt: notification.updatedAt,
+        OR: [{ nextRetryAt: null }, { nextRetryAt: { lte: new Date() } }],
       },
       data: {
         status: NotificationStatus.PROCESSING,
@@ -76,10 +83,18 @@ export class NotificationDeliveryService {
       return { skipped: true, reason: 'not_claimed' };
     }
 
+    let providerResponse: Prisma.InputJsonValue;
     try {
-      const providerResponse = await this.deliverToChannel(notification);
+      providerResponse = await this.deliverToChannel(notification);
+    } catch (error) {
+      return this.recordDeliveryFailure(notification, error);
+    }
 
-      await this.prisma.$transaction(async (tx) => {
+    // Persistence errors must escape to the worker. A successful provider call
+    // must never be classified as a provider failure or consume its retry budget.
+    await this.prisma.$transaction(
+      async (tx) => {
+        await lockDeliveryEvent(tx, notification.eventId);
         await tx.notification.update({
           where: { id: notification.id },
           data: {
@@ -97,21 +112,30 @@ export class NotificationDeliveryService {
           },
         });
         await this.refreshEventStatus(tx, notification.eventId);
-      });
+      },
+      { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted },
+    );
 
-      return { delivered: true };
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      const nextRetryCount = notification.retryCount + 1;
-      const shouldRetry = nextRetryCount <= notification.maxRetries;
-      const retryDelayMs = shouldRetry
-        ? this.calculateRetryDelayMs(nextRetryCount)
-        : 0;
-      const nextRetryAt = shouldRetry
-        ? new Date(Date.now() + retryDelayMs)
-        : null;
+    return { delivered: true };
+  }
 
-      await this.prisma.$transaction(async (tx) => {
+  private async recordDeliveryFailure(
+    notification: NotificationForDelivery,
+    error: unknown,
+  ) {
+    const message = error instanceof Error ? error.message : String(error);
+    const nextRetryCount = notification.retryCount + 1;
+    const shouldRetry = nextRetryCount <= notification.maxRetries;
+    const retryDelayMs = shouldRetry
+      ? this.calculateRetryDelayMs(nextRetryCount)
+      : 0;
+    const nextRetryAt = shouldRetry
+      ? new Date(Date.now() + retryDelayMs)
+      : null;
+
+    const entry = await this.prisma.$transaction(
+      async (tx) => {
+        await lockDeliveryEvent(tx, notification.eventId);
         await tx.notification.update({
           where: { id: notification.id },
           data: {
@@ -137,49 +161,31 @@ export class NotificationDeliveryService {
             },
           },
         });
-        if (shouldRetry && this.outboxService && nextRetryAt) {
-          await tx.deliveryOutbox.upsert({
-            where: {
-              notificationId: notification.id,
-            },
-            create: {
-              notificationId: notification.id,
-              nextAttemptAt: nextRetryAt,
-            },
-            update: {
-              attempts: 0,
-              lastError: null,
-              nextAttemptAt: nextRetryAt,
-            },
-          });
-        }
-        await this.refreshEventStatus(tx, notification.eventId);
-      });
-
-      let queuePending = false;
-      if (shouldRetry) {
-        try {
-          await this.queueService.enqueue(notification.id, retryDelayMs);
-          await this.outboxService?.markEnqueued([notification.id]);
-        } catch (queueError) {
-          queuePending = true;
-          const queueMessage =
-            queueError instanceof Error
-              ? queueError.message
-              : String(queueError);
-          this.logger.warn(
-            `Retry for notification ${notification.id} remains in outbox: ${queueMessage}`,
+        let entry: DeliveryOutbox | undefined;
+        if (shouldRetry && nextRetryAt) {
+          entry = await this.outboxService.schedule(
+            tx,
+            notification.id,
+            nextRetryAt,
           );
         }
-      }
+        await this.refreshEventStatus(tx, notification.eventId);
+        return entry;
+      },
+      { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted },
+    );
 
-      return {
-        delivered: false,
-        retryScheduled: shouldRetry,
-        queuePending,
-        error: message,
-      };
-    }
+    const dispatch = entry
+      ? await this.outboxService.dispatch([entry])
+      : undefined;
+    const queuePending = (dispatch?.pending ?? 0) > 0;
+
+    return {
+      delivered: false,
+      retryScheduled: shouldRetry,
+      queuePending,
+      error: message,
+    };
   }
 
   private async deliverToChannel(notification: NotificationForDelivery) {
@@ -326,14 +332,15 @@ export class NotificationDeliveryService {
       }),
     ]);
 
-    if (openCount > 0) {
-      return;
-    }
-
     await tx.event.update({
       where: { id: eventId },
       data: {
-        status: failedCount > 0 ? EventStatus.FAILED : EventStatus.COMPLETED,
+        status:
+          openCount > 0
+            ? EventStatus.PROCESSING
+            : failedCount > 0
+              ? EventStatus.FAILED
+              : EventStatus.COMPLETED,
       },
     });
   }

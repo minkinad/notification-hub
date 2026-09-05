@@ -28,10 +28,6 @@ import { NotificationsService } from './notifications.service';
     NotificationDeliveryQueueService,
     NotificationDeliveryService,
   ],
-  exports: [
-    NotificationsService,
-    NotificationDeliveryQueueService,
-    NotificationDeliveryOutboxService,
-  ],
+  exports: [NotificationsService, NotificationDeliveryOutboxService],
 })
 export class NotificationsModule {}

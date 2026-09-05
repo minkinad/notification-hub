@@ -10,7 +10,7 @@ import { AuditService } from '@common/audit/audit.service';
 import { PrismaService } from '@common/prisma/prisma.service';
 import { normalizePagination } from '@common/utils/pagination';
 import { NotificationDeliveryOutboxService } from './delivery/notification-delivery-outbox.service';
-import { NotificationDeliveryQueueService } from './delivery/notification-delivery-queue.service';
+import { lockDeliveryEvent } from './delivery/lock-delivery-event';
 import {
   DeadLetterListQueryDto,
   NotificationListQueryDto,
@@ -42,10 +42,7 @@ const notificationDetailsInclude = {
 export class NotificationsService {
   constructor(
     private readonly prisma: PrismaService,
-    @Optional()
-    private readonly queueService?: NotificationDeliveryQueueService,
-    @Optional()
-    private readonly outboxService?: NotificationDeliveryOutboxService,
+    private readonly outboxService: NotificationDeliveryOutboxService,
     @Optional() private readonly auditService?: AuditService,
   ) {}
 
@@ -157,70 +154,51 @@ export class NotificationsService {
     }
 
     const nextRetryAt = new Date(Date.now() + 60_000);
-    const updatedNotification = await this.prisma.$transaction(async (tx) => {
-      const claimed = await tx.notification.updateMany({
-        where: {
-          id,
-          status: notification.status,
-          retryCount: notification.retryCount,
-        },
-        data: {
-          status: NotificationStatus.RETRYING,
-          retryCount: {
-            increment: 1,
+    const { updatedNotification, entry } = await this.prisma.$transaction(
+      async (tx) => {
+        await lockDeliveryEvent(tx, notification.eventId);
+        const claimed = await tx.notification.updateMany({
+          where: {
+            id,
+            status: notification.status,
+            retryCount: notification.retryCount,
           },
-          nextRetryAt,
-          lastError: null,
-        },
-      });
-
-      if (claimed.count !== 1) {
-        throw new ConflictException(
-          'Notification state changed while scheduling retry',
-        );
-      }
-
-      await tx.event.update({
-        where: { id: notification.eventId },
-        data: { status: EventStatus.PROCESSING },
-      });
-
-      if (this.outboxService) {
-        await tx.deliveryOutbox.upsert({
-          where: { notificationId: id },
-          create: {
-            notificationId: id,
-            nextAttemptAt: nextRetryAt,
-          },
-          update: {
-            attempts: 0,
+          data: {
+            status: NotificationStatus.RETRYING,
+            retryCount: {
+              increment: 1,
+            },
+            nextRetryAt,
             lastError: null,
-            nextAttemptAt: nextRetryAt,
           },
         });
-      }
 
-      const updated = await tx.notification.findUnique({
-        where: { id },
-        include: notificationDetailsInclude,
-      });
-      if (!updated) {
-        throw new NotFoundException('Notification not found');
-      }
-      return updated;
-    });
+        if (claimed.count !== 1) {
+          throw new ConflictException(
+            'Notification state changed while scheduling retry',
+          );
+        }
 
-    let queuePending = false;
-    if (this.queueService) {
-      try {
-        await this.queueService.enqueue(id, 60_000);
-        await this.outboxService?.markEnqueued([id]);
-      } catch {
-        queuePending = true;
-      }
-    } else {
-      queuePending = Boolean(this.outboxService);
-    }
+        await tx.event.update({
+          where: { id: notification.eventId },
+          data: { status: EventStatus.PROCESSING },
+        });
+
+        const updated = await tx.notification.findUnique({
+          where: { id },
+          include: notificationDetailsInclude,
+        });
+        if (!updated) {
+          throw new NotFoundException('Notification not found');
+        }
+        const entry = await this.outboxService.schedule(tx, id, nextRetryAt);
+        return { updatedNotification: updated, entry };
+      },
+      { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted },
+    );
+
+    const { pending } = await this.outboxService.dispatch([entry]);
+    const queuePending = pending > 0;
 
     await this.auditService?.log({
       userId,
@@ -252,65 +230,49 @@ export class NotificationsService {
     }
 
     const nextRetryAt = new Date();
-    const updatedNotification = await this.prisma.$transaction(async (tx) => {
-      const claimed = await tx.notification.updateMany({
-        where: {
-          id,
-          status: NotificationStatus.FAILED,
-          retryCount: notification.retryCount,
-        },
-        data: {
-          status: NotificationStatus.RETRYING,
-          retryCount: 0,
-          nextRetryAt,
-          lastError: null,
-          sentAt: null,
-        },
-      });
+    const { updatedNotification, entry } = await this.prisma.$transaction(
+      async (tx) => {
+        await lockDeliveryEvent(tx, notification.eventId);
+        const claimed = await tx.notification.updateMany({
+          where: {
+            id,
+            status: NotificationStatus.FAILED,
+            retryCount: notification.retryCount,
+          },
+          data: {
+            status: NotificationStatus.RETRYING,
+            retryCount: 0,
+            nextRetryAt,
+            lastError: null,
+            sentAt: null,
+          },
+        });
 
-      if (claimed.count !== 1) {
-        throw new ConflictException(
-          'Notification state changed while scheduling replay',
-        );
-      }
+        if (claimed.count !== 1) {
+          throw new ConflictException(
+            'Notification state changed while scheduling replay',
+          );
+        }
 
-      await tx.event.update({
-        where: { id: notification.eventId },
-        data: { status: EventStatus.PROCESSING },
-      });
-      const updated = await tx.notification.findUnique({
-        where: { id },
-        include: notificationDetailsInclude,
-      });
-      if (!updated) {
-        throw new NotFoundException('Notification not found');
-      }
-      await tx.deliveryOutbox.upsert({
-        where: { notificationId: id },
-        create: {
-          notificationId: id,
-          nextAttemptAt: nextRetryAt,
-        },
-        update: {
-          attempts: 0,
-          lastError: null,
-          nextAttemptAt: nextRetryAt,
-        },
-      });
-      return updated;
-    });
+        await tx.event.update({
+          where: { id: notification.eventId },
+          data: { status: EventStatus.PROCESSING },
+        });
+        const updated = await tx.notification.findUnique({
+          where: { id },
+          include: notificationDetailsInclude,
+        });
+        if (!updated) {
+          throw new NotFoundException('Notification not found');
+        }
+        const entry = await this.outboxService.schedule(tx, id, nextRetryAt);
+        return { updatedNotification: updated, entry };
+      },
+      { isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted },
+    );
 
-    let queuePending = false;
-    if (this.queueService) {
-      try {
-        await this.queueService.enqueue(id);
-        await this.outboxService?.markEnqueued([id]);
-      } catch {
-        queuePending = true;
-      }
-    } else {
-      queuePending = true;
-    }
+    const { pending } = await this.outboxService.dispatch([entry]);
+    const queuePending = pending > 0;
 
     await this.auditService?.log({
       userId,

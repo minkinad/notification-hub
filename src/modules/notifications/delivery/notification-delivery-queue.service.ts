@@ -13,23 +13,17 @@ export class NotificationDeliveryQueueService {
     private readonly queue: Queue<NotificationDeliveryJob>,
   ) {}
 
-  async enqueue(notificationId: string, delay = 0) {
+  async enqueue(notificationId: string, scheduleId: string, delay = 0) {
     return this.queue.add(
       'deliver',
       { notificationId },
       {
-        jobId: delay === 0 ? notificationId : undefined,
+        jobId: scheduleId,
         delay,
         attempts: 1,
         removeOnComplete: 1000,
         removeOnFail: 5000,
       },
-    );
-  }
-
-  async enqueueMany(notificationIds: string[]) {
-    await Promise.all(
-      notificationIds.map((notificationId) => this.enqueue(notificationId)),
     );
   }
 }
