@@ -72,12 +72,18 @@ when retrying a timed-out ingest request.
 
 ## Delivery Semantics
 
-Notification Hub is at-least-once for queue scheduling and delivery attempts:
+Notification Hub persists delivery schedules and retries failed queue publication.
+External effects may be repeated; exactly-once delivery is not guaranteed:
 
 - Event and notification records are stored transactionally.
-- Queue scheduling is backed by `delivery_outbox`.
+- Queue scheduling is backed by `delivery_outbox`; initial delivery, retry, and replay use the same dispatcher.
+- Each schedule has its own queue job identity. Retrying publication of one schedule reuses that identity; a new delivery attempt gets a new one.
 - Delivery workers can retry failed provider calls with exponential backoff.
 - Provider endpoints should be idempotent by `notificationId`.
+
+A worker crash after claiming a notification can leave it in `PROCESSING`; automatic lease recovery is not implemented yet. Redis loss after successful queue publication also requires operational recovery. See the [architecture review](ARCHITECTURE.md#delivery-contract-and-remaining-limits).
+
+Ingest reports confirmed dispatches as `notificationsQueued` and unconfirmed dispatches, when present, as `notificationsQueuePending`. Pending confirmation does not necessarily mean the Redis job is absent. Queue availability does not overwrite the event status.
 
 Webhook and HTTP-provider deliveries include:
 
@@ -98,7 +104,7 @@ Webhook and HTTP-provider deliveries include:
 
 Events:
 
-- `PENDING`: stored, no active channels or queue scheduling pending
+- `PENDING`: stored with no active channels; no later automatic fan-out is performed
 - `PROCESSING`: notifications are open
 - `COMPLETED`: all notifications were sent
 - `FAILED`: at least one notification failed and no notifications are open
@@ -119,7 +125,10 @@ uses the delivery outbox if Redis is unavailable.
 ## Health Endpoints
 
 - `GET /api/v1/health/live`: process liveness, no dependency checks
-- `GET /api/v1/health/ready`: readiness with Postgres and Redis checks, returns `503` when not ready
+- `GET /api/v1/health/ready`: readiness with concurrent Postgres/Redis checks; returns `503` on failure, timeout or shutdown
+- `GET /api/v1/health`: diagnostic `200` response; inspect `data.status` and `data.dependencies`, not just HTTP status
+
+Health routes bypass general throttling and set `Cache-Control: no-store`. `HEALTH_CHECK_TIMEOUT_MS` defaults to 2000 ms. Dependency errors expose only `unavailable`, `timeout` or `shutting_down` reasons. Production readiness errors use the standard error envelope with `message: "Service is not ready"`; detailed dependency status is available from the diagnostic route.
 - `GET /api/v1/health`: detailed dependency status
 
 ## Rate Limits

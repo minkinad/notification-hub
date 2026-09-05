@@ -12,9 +12,25 @@ The format is inspired by Keep a Changelog, and this project follows semantic ve
 - Postgres/Redis development infrastructure compose file
 - Readiness and liveness health endpoints
 - Integration guide for application developers
-- Open-source contribution, security, and code of conduct documents
+- Contribution and security guidance
 - Project-scoped idempotency keys for event creation and ingestion
 - Dead-letter notification listing and replay API
+
+- Detailed repository instructions in `AGENTS.md` and production deployment/architecture guidance
+- Real PostgreSQL/Redis delivery integration tests and a dedicated CI job
+- HTTP health contract tests in the quality gate
+- Configurable `HEALTH_CHECK_TIMEOUT_MS` with a 2000 ms default
+
+### Fixed
+
+- Retry/replay queue identities no longer collide with retained delivery jobs
+- Stale outbox acknowledgements cannot delete newly scheduled retries
+- Concurrent delivery results serialize parent event status updates
+- Worker claims enforce due time and observed notification state
+- Provider success followed by persistence failure no longer schedules an automatic resend
+- Partial queue publication reports confirmed/pending counts without overwriting event status
+- Health responses have bounded deadlines, share pending dependency checks, bypass general throttling and disable caching
+- Health diagnostics hide internal driver errors and report unready during shutdown
 
 ### Removed
 
